@@ -1,30 +1,37 @@
 {
   "expo": {
-    "name": "epubreader",
-    "slug": "epubreader",
+    "name": "Lector Epub",
+    "slug": "lectorebub",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.samuelcastillo.lectorepub",
+      "buildNumber": "1"
     },
     "android": {
+      "package": "com.samuelcastillo.lectorepub",
+      "versionCode": 1,
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        "foregroundImage": "./assets/icon.png",
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false
     },
-    "web": {
-      "favicon": "./assets/favicon.png"
-    }
+    "extra": {
+      "eas": {
+        "projectId": "6112afac-bfde-4908-a0c7-1a28cc009230"
+      }
+    },
+    "owner": "samuelcastillo"
   }
 }

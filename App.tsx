@@ -5,6 +5,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
+  Image,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -16,15 +17,20 @@ import { WebView, WebViewMessageEvent } from 'react-native-webview';
 
 type WebCommand =
   | { type: 'loadBook'; payload: { base64: string; startCfi?: string | null } }
-  | { type: 'nextPage' }
-  | { type: 'prevPage' }
-  | { type: 'setFontScale'; payload: { scale: number } }
-  | { type: 'goToPercentage'; payload: { percentage: number } };
+  | { type: 'setFontScale'; payload: { scale: number } };
 
 type ReaderEvent =
   | { type: 'ready' }
-  | { type: 'metadata'; payload?: { title?: string } }
-  | { type: 'relocated'; payload?: { percentage?: number; cfi?: string } }
+  | { type: 'metadata'; payload?: { title?: string; coverDataUrl?: string } }
+  | {
+      type: 'relocated';
+      payload?: {
+        percentage?: number;
+        cfi?: string;
+        currentPage?: number;
+        totalPages?: number;
+      };
+    }
   | { type: 'loading'; payload?: { message?: string } }
   | { type: 'error'; payload?: { message?: string } };
 
@@ -33,6 +39,7 @@ type LibraryBook = {
   name: string;
   title: string;
   uri: string;
+  coverUri?: string | null;
   progress: number;
   lastOpenedAt: number;
 };
@@ -62,12 +69,37 @@ const READER_HTML = `<!DOCTYPE html>
         background: #f6f1e8;
       }
       #viewer {
+        position: relative;
+        z-index: 1;
         width: 100%;
         height: 100%;
+        transition: transform 170ms ease-out;
+        will-change: transform;
+        touch-action: none;
+      }
+      #pageShadow {
+        position: absolute;
+        inset: 0;
+        z-index: 3;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 130ms ease-out;
+      }
+      #pageCurl {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        z-index: 4;
+        width: 0;
+        opacity: 0;
+        pointer-events: none;
+        transform-origin: right center;
+        transition: opacity 110ms ease-out, width 110ms ease-out;
       }
       #loader {
         position: absolute;
         inset: 0;
+        z-index: 6;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -79,6 +111,8 @@ const READER_HTML = `<!DOCTYPE html>
     </style>
   </head>
   <body>
+    <div id="pageShadow"></div>
+    <div id="pageCurl"></div>
     <div id="loader">Cargando lector…</div>
     <div id="viewer"></div>
     <script>
@@ -92,9 +126,268 @@ const READER_HTML = `<!DOCTYPE html>
         for (let i = 0; i < raw.length; i += 1) bytes[i] = raw.charCodeAt(i);
         return bytes.buffer;
       };
+      const blobToDataUrl = (blob) =>
+        new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result || null);
+          reader.onerror = () => reject(new Error('No se pudo leer la portada'));
+          reader.readAsDataURL(blob);
+        });
 
       let book = null;
       let rendition = null;
+      let isAnimatingTurn = false;
+      let isGestureActive = false;
+      let isSwipeIntent = false;
+      let gestureStartX = 0;
+      let gestureStartY = 0;
+      let gestureDeltaX = 0;
+      let gestureWidth = 0;
+      let totalVirtualPages = 0;
+
+      const SWIPE_MIN_PX = 56;
+      const SWIPE_TRIGGER_RATIO = 0.18;
+      const SWIPE_RESISTANCE = 0.48;
+      const TURN_OFFSET_RATIO = 0.2;
+
+      const getViewer = () => document.getElementById('viewer');
+      const getShadow = () => document.getElementById('pageShadow');
+      const getCurl = () => document.getElementById('pageCurl');
+
+      const setCurl = (offset, animated) => {
+        const curl = getCurl();
+        if (!curl) return;
+
+        const width = Math.max(window.innerWidth, 320);
+        const intensity = Math.min(1, Math.abs(offset) / (width * 0.32));
+        const curlWidth = Math.max(0, Math.min(width * 0.26, Math.abs(offset) * 0.82));
+
+        curl.style.transition = animated
+          ? 'opacity 140ms ease-out, width 140ms ease-out, transform 140ms ease-out'
+          : 'none';
+        curl.style.opacity = intensity > 0.03 ? String(intensity * 0.95) : '0';
+        curl.style.width = curlWidth + 'px';
+
+        if (offset < 0) {
+          curl.style.left = '';
+          curl.style.right = '0';
+          curl.style.transformOrigin = 'right center';
+          curl.style.transform = 'perspective(900px) rotateY(' + (-intensity * 22) + 'deg)';
+          curl.style.background =
+            'linear-gradient(90deg, rgba(245,238,226,0.96) 0%, rgba(226,214,193,0.76) 38%, rgba(20,20,20,0.2) 100%)';
+          return;
+        }
+
+        curl.style.right = '';
+        curl.style.left = '0';
+        curl.style.transformOrigin = 'left center';
+        curl.style.transform = 'perspective(900px) rotateY(' + (intensity * 22) + 'deg)';
+        curl.style.background =
+          'linear-gradient(270deg, rgba(245,238,226,0.96) 0%, rgba(226,214,193,0.76) 38%, rgba(20,20,20,0.2) 100%)';
+      };
+
+      const setTurnOffset = (offset, animated) => {
+        const viewer = getViewer();
+        const shadow = getShadow();
+        if (!viewer || !shadow) return;
+
+        viewer.style.transition = animated ? 'transform 170ms ease-out' : 'none';
+        viewer.style.transform = 'translate3d(' + offset + 'px, 0, 0)';
+
+        const strength = Math.min(0.34, Math.abs(offset) / Math.max(1, window.innerWidth) * 0.42);
+        shadow.style.opacity = String(strength);
+        shadow.style.background = offset < 0
+          ? 'linear-gradient(90deg, rgba(0,0,0,0.18), rgba(0,0,0,0) 44%)'
+          : 'linear-gradient(270deg, rgba(0,0,0,0.18), rgba(0,0,0,0) 44%)';
+
+        setCurl(offset, animated);
+      };
+
+      const resetTurnOffset = (animated) => {
+        setTurnOffset(0, animated);
+      };
+
+      const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+
+      const pagePayloadFromLocation = (location) => {
+        if (!location?.start?.cfi) return null;
+
+        const cfi = location.start.cfi;
+        const percentageFromLocation = Number(location?.start?.percentage);
+        let percentage = Number.isFinite(percentageFromLocation) ? percentageFromLocation : null;
+
+        if (!Number.isFinite(percentage) && book?.locations && typeof book.locations.percentageFromCfi === 'function') {
+          const computed = Number(book.locations.percentageFromCfi(cfi));
+          if (Number.isFinite(computed)) percentage = computed;
+        }
+
+        const normalized = Number.isFinite(percentage) ? clamp(Number(percentage), 0, 1) : null;
+        const totalPages = Number(totalVirtualPages) || Number(book?.locations?.length?.() || 0);
+        const currentPage =
+          Number.isFinite(normalized) && totalPages > 0
+            ? clamp(Math.floor(normalized * (totalPages - 1)) + 1, 1, totalPages)
+            : undefined;
+
+        return {
+          cfi,
+          percentage: Number.isFinite(normalized) ? normalized : undefined,
+          currentPage,
+          totalPages: totalPages > 0 ? totalPages : undefined,
+        };
+      };
+
+      const emitRelocated = (location) => {
+        const payload = pagePayloadFromLocation(location);
+        if (!payload) return;
+        postToApp('relocated', payload);
+      };
+
+      const animatePageTurn = async (direction) => {
+        if (!rendition || isAnimatingTurn) return;
+        isAnimatingTurn = true;
+        const width = Math.max(window.innerWidth, 320);
+        const offset = Math.round(width * TURN_OFFSET_RATIO);
+        const leavingOffset = direction === 'next' ? -offset : offset;
+        const enteringOffset = direction === 'next' ? offset : -offset;
+
+        setTurnOffset(leavingOffset, true);
+        await wait(120);
+
+        try {
+          if (direction === 'next') {
+            await rendition.next();
+          } else {
+            await rendition.prev();
+          }
+        } catch {}
+
+        setTurnOffset(enteringOffset, false);
+        await wait(16);
+        setTurnOffset(0, true);
+        await wait(170);
+        resetTurnOffset(false);
+        isAnimatingTurn = false;
+      };
+
+      const onGestureStart = (x, y) => {
+        if (!rendition || isAnimatingTurn) return;
+        isGestureActive = true;
+        isSwipeIntent = false;
+        gestureStartX = x;
+        gestureStartY = y;
+        gestureDeltaX = 0;
+        gestureWidth = Math.max(window.innerWidth, 320);
+      };
+
+      const onGestureMove = (x, y, preventDefaultFn) => {
+        if (!isGestureActive || isAnimatingTurn) return;
+
+        const dx = x - gestureStartX;
+        const dy = y - gestureStartY;
+
+        if (!isSwipeIntent) {
+          const horizontalEnough = Math.abs(dx) > 10;
+          const mostlyHorizontal = Math.abs(dx) > Math.abs(dy) * 1.25;
+          if (!horizontalEnough || !mostlyHorizontal) return;
+          isSwipeIntent = true;
+        }
+
+        if (preventDefaultFn) preventDefaultFn();
+        gestureDeltaX = dx;
+        setTurnOffset(dx * SWIPE_RESISTANCE, false);
+      };
+
+      const onGestureEnd = async () => {
+        if (!isGestureActive) return;
+        isGestureActive = false;
+
+        if (!isSwipeIntent || isAnimatingTurn) {
+          resetTurnOffset(true);
+          return;
+        }
+
+        const threshold = Math.max(SWIPE_MIN_PX, gestureWidth * SWIPE_TRIGGER_RATIO);
+        if (gestureDeltaX <= -threshold) {
+          await animatePageTurn('next');
+          return;
+        }
+        if (gestureDeltaX >= threshold) {
+          await animatePageTurn('prev');
+          return;
+        }
+
+        resetTurnOffset(true);
+      };
+
+      const attachSwipeHandlers = (doc) => {
+        if (!doc || doc.__epubSwipeAttached) return;
+        doc.__epubSwipeAttached = true;
+
+        try {
+          if (doc.documentElement) {
+            doc.documentElement.style.touchAction = 'none';
+            doc.documentElement.style.overscrollBehavior = 'none';
+          }
+          if (doc.body) {
+            doc.body.style.touchAction = 'none';
+            doc.body.style.overscrollBehavior = 'none';
+          }
+        } catch {}
+
+        doc.addEventListener('pointerdown', (event) => {
+          if (event.pointerType === 'mouse' && event.button !== 0) return;
+          onGestureStart(event.clientX, event.clientY);
+        });
+
+        doc.addEventListener('pointermove', (event) => {
+          onGestureMove(event.clientX, event.clientY, () => event.preventDefault());
+        }, { passive: false });
+
+        doc.addEventListener('pointerup', () => {
+          onGestureEnd();
+        });
+
+        doc.addEventListener('pointercancel', () => {
+          isGestureActive = false;
+          isSwipeIntent = false;
+          resetTurnOffset(true);
+        });
+
+        doc.addEventListener('touchstart', (event) => {
+          const touch = event.touches && event.touches[0];
+          if (!touch) return;
+          onGestureStart(touch.clientX, touch.clientY);
+        }, { passive: true });
+
+        doc.addEventListener('touchmove', (event) => {
+          const touch = event.touches && event.touches[0];
+          if (!touch) return;
+          onGestureMove(touch.clientX, touch.clientY, () => event.preventDefault());
+        }, { passive: false });
+
+        doc.addEventListener('touchend', () => {
+          onGestureEnd();
+        }, { passive: true });
+
+        doc.addEventListener('touchcancel', () => {
+          isGestureActive = false;
+          isSwipeIntent = false;
+          resetTurnOffset(true);
+        }, { passive: true });
+
+        doc.addEventListener('mousedown', (event) => {
+          if (event.button !== 0) return;
+          onGestureStart(event.clientX, event.clientY);
+        });
+
+        doc.addEventListener('mousemove', (event) => {
+          onGestureMove(event.clientX, event.clientY, () => event.preventDefault());
+        });
+
+        doc.addEventListener('mouseup', () => {
+          onGestureEnd();
+        });
+      };
 
       const hideLoader = () => {
         const loader = document.getElementById('loader');
@@ -158,9 +451,9 @@ const READER_HTML = `<!DOCTYPE html>
           rendition = book.renderTo('viewer', {
             width: '100%',
             height: '100%',
-            spread: 'none',
-            flow: 'scrolled-doc',
-            manager: 'continuous',
+            spread: 'auto',
+            flow: 'paginated',
+            manager: 'default',
           });
 
           rendition.themes.default({
@@ -175,14 +468,14 @@ const READER_HTML = `<!DOCTYPE html>
           rendition.themes.override('background', '#f6f1e8', true);
 
           rendition.on('relocated', (location) => {
-            if (!location?.start?.cfi) return;
-            const cfi = location.start.cfi;
-            const percentageFromLocation = Number(location?.start?.percentage);
-            const percentage = Number.isFinite(percentageFromLocation)
-              ? percentageFromLocation
-              : undefined;
-            postToApp('relocated', { percentage, cfi });
+            emitRelocated(location);
           });
+
+          rendition.on('rendered', (_section, view) => {
+            attachSwipeHandlers(view?.document);
+          });
+
+          attachSwipeHandlers(document);
 
           const displayTargets = [];
           if (startCfi) displayTargets.push(startCfi);
@@ -222,9 +515,33 @@ const READER_HTML = `<!DOCTYPE html>
           postToApp('loading', { message: 'Cargando metadatos...' });
           await book.ready;
 
+          postToApp('loading', { message: 'Calculando paginas...' });
+          try {
+            await book.locations.generate(1200);
+            totalVirtualPages = Number(book?.locations?.length?.() || 0);
+          } catch {
+            totalVirtualPages = Number(book?.locations?.length?.() || 0);
+          }
+
           const metadata = await book.loaded.metadata;
-          postToApp('metadata', { title: metadata?.title || '' });
-          postToApp('loading', { message: 'Libro listo' });
+          let coverDataUrl = null;
+          try {
+            const coverUrl = await book.coverUrl();
+            if (coverUrl) {
+              const coverResponse = await fetch(coverUrl);
+              const coverBlob = await coverResponse.blob();
+              coverDataUrl = await blobToDataUrl(coverBlob);
+              if (typeof coverUrl === 'string' && coverUrl.startsWith('blob:')) {
+                URL.revokeObjectURL(coverUrl);
+              }
+            }
+          } catch {}
+
+          postToApp('metadata', {
+            title: metadata?.title || '',
+            coverDataUrl: typeof coverDataUrl === 'string' ? coverDataUrl : undefined,
+          });
+          emitRelocated(rendition.currentLocation?.());
         } catch (error) {
           hideLoader();
           postToApp('error', {
@@ -248,19 +565,6 @@ const READER_HTML = `<!DOCTYPE html>
           switch (message.type) {
             case 'loadBook':
               await loadBook(message.payload.base64, message.payload.startCfi);
-              break;
-            case 'nextPage':
-              await rendition?.next();
-              break;
-            case 'prevPage':
-              await rendition?.prev();
-              break;
-            case 'goToPercentage':
-              if (book && book.locations?.length()) {
-                const clamped = Math.min(1, Math.max(0, Number(message.payload?.percentage || 0)));
-                const cfi = book.locations.cfiFromPercentage(clamped);
-                if (cfi) await rendition?.display(cfi);
-              }
               break;
             case 'setFontScale':
               if (rendition) {
@@ -389,6 +693,7 @@ export default function App() {
         name: file.name || 'Libro sin titulo',
         title: file.name || 'Libro sin titulo',
         uri: persistedUri,
+        coverUri: null,
         progress: 0,
         lastOpenedAt: Date.now(),
       };
@@ -494,7 +799,7 @@ export default function App() {
       if (parsed.type === 'ready') {
         setBookReady(true);
         setShowControls(true);
-        setStatusText('Libro listo');
+        setStatusText('Calculando paginas...');
         sendCommand({ type: 'setFontScale', payload: { scale: fontScale } });
         return;
       }
@@ -502,9 +807,12 @@ export default function App() {
       if (parsed.type === 'metadata') {
         if (parsed.payload?.title) {
           setBookName(parsed.payload.title);
-          if (bookId) {
-            patchLibraryBook(bookId, { title: parsed.payload.title });
-          }
+        }
+        if (bookId) {
+          patchLibraryBook(bookId, {
+            ...(parsed.payload?.title ? { title: parsed.payload.title } : null),
+            ...(parsed.payload?.coverDataUrl ? { coverUri: parsed.payload.coverDataUrl } : null),
+          });
         }
         return;
       }
@@ -512,6 +820,14 @@ export default function App() {
       if (parsed.type === 'relocated') {
         if (typeof parsed.payload?.percentage === 'number') {
           setProgress(parsed.payload.percentage);
+        }
+        if (
+          typeof parsed.payload?.currentPage === 'number' &&
+          typeof parsed.payload?.totalPages === 'number'
+        ) {
+          setStatusText(`${parsed.payload.currentPage}/${parsed.payload.totalPages}`);
+        } else if (typeof parsed.payload?.currentPage === 'number') {
+          setStatusText(`${parsed.payload.currentPage}/...`);
         }
         if (bookId && parsed.payload?.cfi) {
           if (saveTimeoutRef.current) {
@@ -549,18 +865,11 @@ export default function App() {
     }
   }, [bookId, fontScale, patchLibraryBook, progress, sendCommand]);
 
-  const shelfBooks = useMemo(() => {
-    return library
-      .slice()
-      .sort((a, b) => b.lastOpenedAt - a.lastOpenedAt)
-      .slice(0, 7)
-      .map((book) => book.title || book.name);
-  }, [library]);
-
   const quickAccessBooks = useMemo(
     () => library.slice().sort((a, b) => b.lastOpenedAt - a.lastOpenedAt),
     [library],
   );
+  const featuredBooks = useMemo(() => quickAccessBooks.slice(0, 8), [quickAccessBooks]);
 
   const spineColors = ['#5b3a2b', '#6f5039', '#7d2f2f', '#3f5d57', '#49406a', '#7a5b2f', '#3f4a54'];
 
@@ -569,82 +878,111 @@ export default function App() {
       <StatusBar style="dark" />
 
       {!bookBase64 ? (
-        <ScrollView contentContainerStyle={styles.homeContent} style={styles.homeScroll}>
-          <View style={styles.header}>
-            <View style={styles.toolbar}>
-              <TouchableOpacity style={styles.button} onPress={pickEpubFile} disabled={isPickingFile}>
-                <Text style={styles.buttonText}>
-                  {isPickingFile ? 'Abriendo…' : 'Agregar EPUB'}
-                </Text>
-              </TouchableOpacity>
-              <Text style={styles.progress}>{quickAccessBooks.length} libros</Text>
-            </View>
+        <>
+          <ScrollView contentContainerStyle={styles.homeContent} style={styles.homeScroll}>
+            <View style={styles.header}>
+              <View style={styles.toolbar}>
+                <Text style={styles.libraryTitle}>Biblioteca</Text>
+                <Text style={styles.progress}>{quickAccessBooks.length} libros</Text>
+              </View>
 
-            <View style={styles.shelfBackPanel}>
-              <View style={styles.spineRow}>
-                {(shelfBooks.length ? shelfBooks : ['Biblioteca', 'Sin', 'Libros', 'Aun']).map(
-                  (title, index) => (
-                    <View
-                      key={`${title}-${index}`}
-                      style={[
-                        styles.spine,
-                        {
-                          backgroundColor: spineColors[index % spineColors.length],
-                          height: 84 + (index % 4) * 14,
-                        },
-                      ]}
-                    >
-                      <View style={styles.spineStripe} />
-                      <Text style={styles.spineText} numberOfLines={1}>
-                        {title}
-                      </Text>
-                    </View>
-                  ),
+              <View style={styles.featuredStrip}>
+                <Text style={styles.bookTitle} numberOfLines={1}>
+                  Continua leyendo
+                </Text>
+                {featuredBooks.length === 0 ? (
+                  <Text style={styles.featuredEmptyText}>
+                    Agrega tu primer EPUB para ver portadas aqui.
+                  </Text>
+                ) : (
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={styles.featuredRow}
+                  >
+                    {featuredBooks.map((book, index) => (
+                      <TouchableOpacity
+                        key={book.id}
+                        style={styles.featuredCard}
+                        onPress={() => openLibraryBook(book)}
+                        activeOpacity={0.9}
+                      >
+                        {book.coverUri ? (
+                          <Image
+                            source={{ uri: book.coverUri }}
+                            style={styles.featuredCoverImage}
+                            resizeMode="cover"
+                          />
+                        ) : (
+                          <View
+                            style={[
+                              styles.featuredCoverFallback,
+                              { backgroundColor: spineColors[index % spineColors.length] },
+                            ]}
+                          >
+                            <Text numberOfLines={3} style={styles.featuredCoverText}>
+                              {book.title || book.name}
+                            </Text>
+                          </View>
+                        )}
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
                 )}
               </View>
-              <View style={styles.shelfWood} />
             </View>
 
-            <Text style={styles.bookTitle} numberOfLines={1}>
-              Accesos directos
-            </Text>
-          </View>
-
-          {quickAccessBooks.length === 0 ? (
-            <View style={styles.emptyLibrary}>
-              <Text style={styles.emptyLibraryTitle}>Tu librero esta vacio</Text>
-              <Text style={styles.emptyLibraryText}>
-                Agrega un EPUB y aparecera aqui para abrirlo con un toque.
-              </Text>
-            </View>
-          ) : (
-            <View style={styles.grid}>
-              {quickAccessBooks.map((book, index) => (
-                <TouchableOpacity
-                  key={book.id}
-                  style={styles.card}
-                  onPress={() => openLibraryBook(book)}
-                  activeOpacity={0.85}
-                >
-                  <View
-                    style={[
-                      styles.cover,
-                      { backgroundColor: spineColors[index % spineColors.length] },
-                    ]}
+            {quickAccessBooks.length === 0 ? (
+              <View style={styles.emptyLibrary}>
+                <Text style={styles.emptyLibraryTitle}>Tu librero esta vacio</Text>
+                <Text style={styles.emptyLibraryText}>
+                  Agrega un EPUB y aparecera aqui para abrirlo con un toque.
+                </Text>
+              </View>
+            ) : (
+              <View style={styles.grid}>
+                {quickAccessBooks.map((book, index) => (
+                  <TouchableOpacity
+                    key={book.id}
+                    style={styles.card}
+                    onPress={() => openLibraryBook(book)}
+                    activeOpacity={0.85}
                   >
-                    <Text style={styles.coverTitle} numberOfLines={3}>
+                    {book.coverUri ? (
+                      <Image source={{ uri: book.coverUri }} style={styles.coverImage} resizeMode="cover" />
+                    ) : (
+                      <View
+                        style={[
+                          styles.cover,
+                          { backgroundColor: spineColors[index % spineColors.length] },
+                        ]}
+                      >
+                        <Text style={styles.coverTitle} numberOfLines={3}>
+                          {book.title || book.name}
+                        </Text>
+                      </View>
+                    )}
+                    <Text numberOfLines={2} style={styles.cardTitle}>
                       {book.title || book.name}
                     </Text>
-                  </View>
-                  <Text numberOfLines={2} style={styles.cardTitle}>
-                    {book.title || book.name}
-                  </Text>
-                  <Text style={styles.cardMeta}>Progreso: {Math.round((book.progress || 0) * 100)}%</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          )}
-        </ScrollView>
+                    <Text style={styles.cardMeta}>
+                      Progreso: {Math.round((book.progress || 0) * 100)}%
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            )}
+          </ScrollView>
+          <TouchableOpacity
+            style={[styles.addFab, isPickingFile && styles.addFabDisabled]}
+            onPress={pickEpubFile}
+            disabled={isPickingFile}
+            activeOpacity={0.9}
+          >
+            <Text style={styles.addFabPlus}>＋</Text>
+            <Text style={styles.addFabText}>{isPickingFile ? 'Abriendo...' : 'Agregar'}</Text>
+          </TouchableOpacity>
+        </>
       ) : (
         <>
           <View style={[styles.readerContainer, bookReady && styles.readerContainerFullscreen]}>
@@ -664,52 +1002,23 @@ export default function App() {
 
           {bookReady && (
             <TouchableOpacity style={styles.controlsToggle} onPress={() => setShowControls((v) => !v)}>
-              <Text style={styles.controlsToggleText}>{showControls ? 'Ocultar' : 'Menu'}</Text>
+              <Text style={styles.controlsToggleText}>{showControls ? 'Cerrar' : 'Menu'}</Text>
             </TouchableOpacity>
           )}
 
-          <View
-            style={[
-              styles.footer,
-              bookReady && styles.footerFloating,
-              bookReady && !showControls && styles.hiddenControls,
-            ]}
-          >
-            <TouchableOpacity
-              style={[styles.button, styles.navButton]}
-              onPress={() => {
-                setShowControls(true);
-                sendCommand({ type: 'prevPage' });
-              }}
-              disabled={!bookReady}
-            >
-              <Text style={styles.buttonText}>Anterior</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.button, styles.navButton]}
-              onPress={() => {
-                setShowControls(true);
-                sendCommand({ type: 'nextPage' });
-              }}
-              disabled={!bookReady}
-            >
-              <Text style={styles.buttonText}>Siguiente</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity style={[styles.button, styles.changeBookButton]} onPress={goToLibrary}>
-              <Text style={styles.buttonText}>Librero</Text>
-            </TouchableOpacity>
-          </View>
-
           {bookReady && (
-            <View style={[styles.fontBar, !showControls && styles.hiddenControls]}>
-              <TouchableOpacity style={styles.smallButton} onPress={() => changeFontScale(-0.1)}>
-                <Text style={styles.smallButtonText}>A-</Text>
-              </TouchableOpacity>
-              <Text style={styles.fontLabel}>{Math.round(fontScale * 100)}%</Text>
-              <TouchableOpacity style={styles.smallButton} onPress={() => changeFontScale(0.1)}>
-                <Text style={styles.smallButtonText}>A+</Text>
+            <View style={[styles.readerMenu, !showControls && styles.hiddenControls]}>
+              <View style={styles.fontRow}>
+                <TouchableOpacity style={styles.smallButton} onPress={() => changeFontScale(-0.1)}>
+                  <Text style={styles.smallButtonText}>A-</Text>
+                </TouchableOpacity>
+                <Text style={styles.fontLabel}>{Math.round(fontScale * 100)}%</Text>
+                <TouchableOpacity style={styles.smallButton} onPress={() => changeFontScale(0.1)}>
+                  <Text style={styles.smallButtonText}>A+</Text>
+                </TouchableOpacity>
+              </View>
+              <TouchableOpacity style={styles.exitButton} onPress={goToLibrary}>
+                <Text style={styles.exitButtonText}>Salir del libro</Text>
               </TouchableOpacity>
             </View>
           )}
@@ -728,28 +1037,70 @@ export default function App() {
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: '#261910',
+    backgroundColor: '#f5f1e8',
   },
   homeScroll: {
     flex: 1,
   },
   homeContent: {
-    paddingBottom: 24,
+    paddingBottom: 120,
   },
   header: {
     paddingHorizontal: 16,
-    paddingTop: 8,
-    paddingBottom: 10,
-    borderBottomWidth: 2,
-    borderBottomColor: '#4a2f1f',
+    paddingTop: 10,
+    paddingBottom: 14,
     gap: 10,
-    backgroundColor: '#3a2417',
+    backgroundColor: '#efe8da',
   },
   toolbar: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: 10,
+  },
+  libraryTitle: {
+    color: '#352c21',
+    fontSize: 20,
+    fontWeight: '700',
+  },
+  featuredStrip: {
+    borderRadius: 16,
+    backgroundColor: '#fffdf8',
+    borderWidth: 1,
+    borderColor: '#dfd4c0',
+    padding: 10,
+    gap: 8,
+  },
+  featuredEmptyText: {
+    color: '#7a6d5d',
+    fontSize: 13,
+  },
+  featuredRow: {
+    gap: 10,
+    paddingRight: 4,
+  },
+  featuredCard: {
+    width: 76,
+    borderRadius: 10,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#d7cab2',
+    backgroundColor: '#f1e8d7',
+  },
+  featuredCoverImage: {
+    width: '100%',
+    aspectRatio: 0.68,
+  },
+  featuredCoverFallback: {
+    width: '100%',
+    aspectRatio: 0.68,
+    justifyContent: 'flex-end',
+    padding: 6,
+  },
+  featuredCoverText: {
+    color: '#fff7ea',
+    fontSize: 10,
+    fontWeight: '700',
   },
   shelfBackPanel: {
     borderRadius: 12,
@@ -807,17 +1158,22 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
     gap: 12,
     paddingHorizontal: 12,
-    paddingTop: 10,
+    paddingTop: 14,
   },
   card: {
     width: '30%',
     minWidth: 100,
     maxWidth: 140,
-    borderRadius: 10,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#6f4b35',
-    backgroundColor: '#2b1b12',
+    borderColor: '#d2c4ae',
+    backgroundColor: '#fffdf8',
     padding: 8,
+    shadowColor: '#5f4e34',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.16,
+    shadowRadius: 10,
+    elevation: 3,
   },
   cover: {
     aspectRatio: 0.68,
@@ -826,19 +1182,24 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     justifyContent: 'flex-end',
   },
+  coverImage: {
+    width: '100%',
+    aspectRatio: 0.68,
+    borderRadius: 8,
+  },
   coverTitle: {
-    color: '#f7e7d1',
+    color: '#fff4dd',
     fontSize: 12,
     fontWeight: '700',
   },
   cardTitle: {
-    color: '#efd8b8',
+    color: '#3b3327',
     fontSize: 12,
     fontWeight: '700',
     marginTop: 8,
   },
   cardMeta: {
-    color: '#be9f79',
+    color: '#7c6c57',
     fontSize: 11,
     marginTop: 4,
   },
@@ -847,18 +1208,18 @@ const styles = StyleSheet.create({
     marginTop: 12,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: '#6f4b35',
-    backgroundColor: '#2b1b12',
+    borderColor: '#d2c4ae',
+    backgroundColor: '#fffdf8',
     padding: 14,
     gap: 6,
   },
   emptyLibraryTitle: {
-    color: '#efd8b8',
+    color: '#3d3528',
     fontWeight: '700',
     fontSize: 15,
   },
   emptyLibraryText: {
-    color: '#be9f79',
+    color: '#7f705b',
     fontSize: 13,
   },
   readerContainer: {
@@ -883,70 +1244,88 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#f6f1e8',
   },
-  footer: {
-    flexDirection: 'row',
-    gap: 10,
-    paddingHorizontal: 12,
-    paddingBottom: 8,
-    backgroundColor: '#3a2417',
-  },
-  footerFloating: {
-    position: 'absolute',
-    left: 12,
-    right: 12,
-    bottom: 58,
-    backgroundColor: 'transparent',
-  },
   hiddenControls: {
     opacity: 0,
   },
   controlsToggle: {
     position: 'absolute',
-    right: 12,
-    bottom: 20,
+    right: 16,
+    bottom: 22,
     zIndex: 30,
-    borderRadius: 8,
+    borderRadius: 18,
     borderWidth: 1,
-    borderColor: '#836044',
-    backgroundColor: 'rgba(33, 21, 13, 0.86)',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
+    borderColor: 'rgba(255,255,255,0.62)',
+    backgroundColor: 'rgba(246, 247, 250, 0.83)',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.12,
+    shadowRadius: 14,
+    elevation: 5,
   },
   controlsToggleText: {
-    color: '#f2dec3',
+    color: '#1f2530',
     fontSize: 12,
-    fontWeight: '700',
+    fontWeight: '600',
   },
-  fontBar: {
+  readerMenu: {
     position: 'absolute',
-    left: 12,
-    right: 12,
-    bottom: 18,
+    left: 14,
+    right: 14,
+    bottom: 70,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.76)',
+    backgroundColor: 'rgba(242, 244, 248, 0.9)',
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    gap: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 14 },
+    shadowOpacity: 0.16,
+    shadowRadius: 24,
+    elevation: 8,
+    zIndex: 25,
+  },
+  fontRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 10,
-    zIndex: 25,
+    gap: 12,
   },
   smallButton: {
-    minWidth: 44,
-    borderRadius: 8,
+    minWidth: 46,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#8f5c3d',
-    backgroundColor: '#6b3b2a',
-    paddingVertical: 8,
+    borderColor: 'rgba(116, 126, 146, 0.28)',
+    backgroundColor: '#ffffff',
+    paddingVertical: 9,
     alignItems: 'center',
   },
   smallButtonText: {
-    color: '#f7e5cc',
+    color: '#2a3240',
     fontWeight: '700',
   },
   fontLabel: {
-    color: '#f2dec3',
-    fontSize: 13,
+    color: '#293140',
+    fontSize: 14,
     fontWeight: '700',
-    minWidth: 54,
+    minWidth: 66,
     textAlign: 'center',
+  },
+  exitButton: {
+    borderRadius: 14,
+    backgroundColor: '#ffffff',
+    borderWidth: 1,
+    borderColor: 'rgba(116, 126, 146, 0.28)',
+    paddingVertical: 11,
+    alignItems: 'center',
+  },
+  exitButtonText: {
+    color: '#2a3240',
+    fontWeight: '600',
+    fontSize: 14,
   },
   statusBar: {
     paddingHorizontal: 12,
@@ -967,11 +1346,6 @@ const styles = StyleSheet.create({
     color: '#d1b088',
     fontSize: 12,
   },
-  changeBookButton: {
-    flex: 1,
-    backgroundColor: '#4f5d31',
-    borderColor: '#697a3f',
-  },
   button: {
     backgroundColor: '#6b3b2a',
     borderRadius: 10,
@@ -990,13 +1364,46 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   bookTitle: {
-    color: '#f2dec3',
+    color: '#352c21',
     fontSize: 16,
     fontWeight: '700',
   },
   progress: {
-    color: '#d7ba93',
+    color: '#6a5b49',
     fontSize: 14,
     fontWeight: '700',
+  },
+  addFab: {
+    position: 'absolute',
+    right: 16,
+    bottom: 28,
+    height: 56,
+    borderRadius: 28,
+    paddingHorizontal: 18,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: '#111827',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.3)',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.3,
+    shadowRadius: 18,
+    elevation: 9,
+  },
+  addFabDisabled: {
+    opacity: 0.66,
+  },
+  addFabPlus: {
+    color: '#f9fafb',
+    fontSize: 20,
+    fontWeight: '600',
+    marginTop: -1,
+  },
+  addFabText: {
+    color: '#f9fafb',
+    fontSize: 15,
+    fontWeight: '600',
   },
 });
